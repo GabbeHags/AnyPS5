@@ -10399,6 +10399,7 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
                 const auto slabRetilesBefore = StorageTexture::SlabRetiles();
                 const auto paddingSeedsBefore = StorageTexture::PaddingSeedCopies();
                 const auto importRetilesBefore = StorageTexture::LinearImportRetiles();
+                const bool watchedAtWriteBack = watched && AgcDriver::GuestMemory::Watched(address, surfaceBytes);
                 image->WriteBack();
                 recorder.Submit();
                 device.WaitQueue();
@@ -10412,7 +10413,7 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
                 const auto* surfaceImport = watched ? HostImportFor(context, address, surfaceBytes) : nullptr;
                 const bool deviceLocalImport = surfaceImport != nullptr && HostImportDeviceLocal(context, *surfaceImport);
                 static const bool hostRetile = std::getenv("APS5_LINEAR_IMPORT_RETILE_HOST") != nullptr;
-                const bool expectImportRetile = importRetile && (deviceLocalImport || hostRetile) && test.tileMode == TextureTileMode::kLinear && watched && AgcDriver::GuestMemory::Watched(address, surfaceBytes);
+                const bool expectImportRetile = importRetile && (deviceLocalImport || hostRetile) && test.tileMode == TextureTileMode::kLinear && watchedAtWriteBack;
                 if (expectImportRetile && importRetiled == 0) failures += what + ": the linear write-back went through its scratch instead of retiling into the import\n";
                 if (!importRetile && importRetiled != 0) failures += what + ": the linear write-back retiled into the import with APS5_NO_LINEAR_IMPORT_RETILE set\n";
                 if (watched && !deviceLocalImport && !hostRetile && importRetiled != 0) failures += what + ": the linear write-back retiled into an import outside a device-local heap\n";
