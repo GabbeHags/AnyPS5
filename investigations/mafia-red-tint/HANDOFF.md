@@ -3,18 +3,37 @@
 Summary of everything found so far, for a fresh session. The run-by-run log with every detail is
 [NOTES.md](NOTES.md); this file is the short version. Nothing here is fixed.
 
-## The symptom and the angle to take next
+## Status (session 2, 2026-11-23 late evening): cause found
+
+- **Cause:** the game builds the colour-grading LUT on the CPU (`exe+0x6e5bc0`) from a GPU readback. It records a
+  `256x16` texture-to-buffer copy (a compute dispatch), calls the engine's Map with wait = 1 (`exe+0x8c7870`), and
+  converts what it maps. **Map gives up after about 1 s** (measured 1005 and 1021 ms). During the city load AnyPS5
+  is about 76 submissions (more than 1 s) behind the game, so the copy hasn't run yet and the builder converts stale
+  memory: old R32F `1.0f` data, which the builder turns into `0xff800000`. In the intro AnyPS5 keeps up, the copy
+  lands first and the LUT is right. **That is the whole difference between the save and no-save runs.**
+- **Proof:** `APS5_LUT_BUILD_DELAY_MS=4000` (hold the builder after Map returns) gives a clean city LUT and correct
+  colours on screen.
+- **Not** a shader, cache, write-back, depth-store or `powf` bug. The game's `powf` is its own bundled Sony libc
+  (`libc.prx.guest.prx`), not AnyPS5's.
+- Details and runs: [NOTES.md](NOTES.md), section "Session 2".
+
+### What comes next
+
+1. Find what Map waits on and why it times out: `objdump` from `exe+0x8c7870` (helper `exe+0x8c79c0`), or re-convert
+   the exe with `--trace-imports` and run with `APS5_TRACE_CALLS=all` to see the wait call (label poll with usleep,
+   `sceKernelWaitEqueue`, an `sceAgcDriver` call). That is the likely fix site: a CPU wait on a GPU completion should
+   make AnyPS5 drive its queue up to the awaited point, so no guest timeout can expire while work is still queued in
+   front of it.
+2. Find why AnyPS5 is more than 1 s behind during the city load: `APS5_TRACE_PREPARATION_WAIT`, pipeline compile
+   timings, and `tools/trace_digest.py` around the second LUT build.
+
+## The original symptom
 
 - Mafia: Definitive Edition (PPSA36458) on AnyPS5: the whole 3D scene is tinted red (lights pink, sky purple). The HUD
   is fine. Still present on `main` at `6555c1425a`.
-- **The trigger is the save game.** With the two saves `_sd\gaslo7dd33c65*` and `_sd\gasloc9e9842f*` in place the game
-  loads straight into the open city and is red. With them set aside it starts at the intro, which is **not** red.
-  (Found in the first session with `launchers\reset-test.ps1`; setting aside the profile, video settings, boot
-  counter, `vfs_prospero.bin` or `shader_cache` changed nothing.)
-- Suggested new angle: find out **why the intro / no-save path is not red**. Does it build its colour-grading LUT
-  through the same path described below (compute pass, then `C_ColorGradingTextureUpdater` on the CPU)? If yes, what
-  differs: inputs, timing, memory placement? If no, which path does it use? The lut-watch tooling below works for
-  that comparison.
+- It looked like the save game was the trigger: with the two saves `_sd\gaslo7dd33c65*` and `_sd\gasloc9e9842f*` the
+  game loads straight into the open city and is red; without them it starts at the intro, which is not red. Session 2
+  showed this is timing (see above).
 
 ## What is wrong (established)
 
@@ -35,7 +54,8 @@ Summary of everything found so far, for a fresh session. The run-by-run log with
    `0x30513043`), with input `T057_ColorGradingInput` / `m_ColorGradingInputTexture` (code refs `+0x1af38d0`,
    `+0x1af3c50`). Other related strings: `Disable color-grading Post Fx`, `m_HdrColorGradingMode`,
    `E_SM_ESSV_UPDATE_LUT_CS`.
-6. So the `-inf` values are **already in the CPU staging buffer** when the tiler copies it. The tiler, the GPU-side
+6. So the bad values are **already in the CPU staging buffer** when the tiler copies it. (Session 2: the
+   builder converted a stale readback; `0xff800000` is its output for a `1.0f` source texel, not `-inf`.) The tiler, the GPU-side
    handling of the LUT memory and the final pass are not at fault.
 
 ## Strong lead, not fully explained
@@ -114,6 +134,8 @@ Summary of everything found so far, for a fresh session. The run-by-run log with
 | `APS5_STORAGE_WRITEBACK_KEEP_GUEST=1` | `Texture.cpp` `writeBackLayers`, `GuestMemory::WriteChangedCommittedKeepingGuest` | write-back keeps guest-changed bytes (experiment, no effect on the tint) |
 | `APS5_DEPTH_DROP_STALE_STORE=1` | `DepthSurface.cpp` (`FlushDepthPlanes`, `retireStoringStale`) | drops stale depth units instead of storing them (experiment; can break effects) |
 | `APS5_WATCH_RANGE=<64K-aligned hex>:<hex bytes>` | libc `CrashReport.cpp` | write-protects the first page of each 64 KiB slot, reports writers with stacks, separate fault budget for driver writes. Disturbs rendering, may have caused #3 |
+| `APS5_TRACE_LUT_BUILD=1` | libc `CrashReport.cpp` (`LutBuildProbe`, `PowfHook`, `MapHook`) | hooks the game's `powf` GOT slot (`exe+0x4fadd90`) and the device Map vtable entry; logs `[lut-build]` builds with their source buffer, dumps `lut-build-src-*.bin`, times Map. Launcher argument `build` |
+| `APS5_LUT_BUILD_DELAY_MS=<ms>` | same | holds the LUT builder after Map returns (experiment; removes the tint). Launcher argument `delay` (4000) |
 | `APS5_VERIFY_SHADER_CACHE=1` | `Recompiler.cpp` (committed) | compares disk-cache hits with fresh compiles |
 
 Existing AnyPS5 aids that were useful: `APS5_WATCH_ADDR=<hex>` (one-page CPU write watch with stack),

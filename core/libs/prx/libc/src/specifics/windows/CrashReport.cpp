@@ -24,6 +24,7 @@
 #include <vector>
 #include "Sse4aEmulation.hpp"
 
+
 namespace {
 
 // The reporter runs on a faulting thread that may itself hold the CRT stream lock (a fault inside
@@ -206,6 +207,108 @@ bool HandleRangeWatch(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+void LutBuildProbe(void* returnAddress, void* frameAddress) {
+    static const auto exe = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    const auto offset = reinterpret_cast<std::uintptr_t>(returnAddress) - exe;
+    const char* mode = nullptr;
+    if (offset == 0x6e65d1) mode = "per-channel";
+    else if (offset == 0x6e6126) mode = "luma";
+    else if (offset == 0x6e62ae) mode = "identity (no input)";
+    const auto* frame = static_cast<const std::uint64_t*>(frameAddress);
+    static std::atomic<std::uint32_t> seen{0};
+    if (seen.fetch_add(1) < 12) {
+        char where[MAX_PATH + 64], caller[MAX_PATH + 64];
+        DescribeAddress(reinterpret_cast<std::uint64_t>(returnAddress), where, sizeof(where));
+        DescribeAddress(IsReadable(frame[0] + 8) ? reinterpret_cast<const std::uint64_t*>(frame[0])[1] : 0, caller, sizeof(caller));
+        Report("[lut-build] powf(x, 2.2) from %s (frame ra %s, caller %s)\n", where, frame[1] == reinterpret_cast<std::uint64_t>(returnAddress) ? "matches" : "differs", caller);
+    }
+    if (mode == nullptr) return;
+    if (frame[1] != reinterpret_cast<std::uint64_t>(returnAddress)) return;
+    const auto rbp = frame[0];
+    static std::atomic<std::uint64_t> lastKey{0};
+    static std::atomic<std::uint32_t> builds{0};
+    std::uint64_t source = 0, output = 0;
+    std::uint32_t parameter = 0;
+    if (IsReadable(rbp - 0x170)) {
+        source = *reinterpret_cast<const std::uint64_t*>(rbp - 0x160);
+        output = *reinterpret_cast<const std::uint64_t*>(rbp - 0x148);
+        parameter = *reinterpret_cast<const std::uint32_t*>(rbp - 0x16c);
+    }
+    const auto key = rbp ^ (source * 31) ^ (output * 131) ^ offset;
+    if (lastKey.exchange(key) == key) return;
+    const auto build = builds.fetch_add(1);
+    if (build >= 64) return;
+    float parameterFloat;
+    std::memcpy(&parameterFloat, &parameter, 4);
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (offset == 0x6e62ae) {
+        Report("[lut-build] #%u %s: thread %lu output 0x%llx at %lld ms\n", build, mode, GetCurrentThreadId(), static_cast<unsigned long long>(output), static_cast<long long>(now));
+        return;
+    }
+    std::uint32_t floatOne = 0, zero = 0, opaque = 0;
+    const bool readable = source != 0 && IsReadable(source) && IsReadable(source + 0x3fff);
+    if (readable) {
+        const auto* words = reinterpret_cast<const std::uint32_t*>(source);
+        for (int i = 0; i < 4096; ++i) {
+            floatOne += words[i] == 0x3f800000u;
+            zero += words[i] == 0u;
+            opaque += (words[i] >> 24) == 0xffu;
+        }
+    }
+    Report("[lut-build] #%u %s (param %g): thread %lu source 0x%llx output 0x%llx at %lld ms: source %s, %u x 1.0f, %u zero, %u alpha-ff of 4096\n", build, mode, static_cast<double>(parameterFloat), GetCurrentThreadId(), static_cast<unsigned long long>(source), static_cast<unsigned long long>(output), static_cast<long long>(now), readable ? "readable" : "NOT readable", floatOne, zero, opaque);
+    if (IsReadable(rbp - 0x210)) {
+        const auto device = *reinterpret_cast<const std::uint64_t*>(rbp - 0x210);
+        const auto object = IsReadable(device) ? *reinterpret_cast<const std::uint64_t*>(device) : 0;
+        const auto table = IsReadable(object) ? *reinterpret_cast<const std::uint64_t*>(object) : 0;
+        if (IsReadable(table + 0x58)) {
+            char copy[MAX_PATH + 64], map[MAX_PATH + 64], unmap[MAX_PATH + 64];
+            DescribeAddress(reinterpret_cast<const std::uint64_t*>(table)[0x48 / 8], copy, sizeof(copy));
+            DescribeAddress(reinterpret_cast<const std::uint64_t*>(table)[0x50 / 8], map, sizeof(map));
+            DescribeAddress(reinterpret_cast<const std::uint64_t*>(table)[0x58 / 8], unmap, sizeof(unmap));
+            Report("[lut-build]   device 0x%llx vtable 0x%llx: +0x48 %s, +0x50 %s, +0x58 %s\n", static_cast<unsigned long long>(object), static_cast<unsigned long long>(table), copy, map, unmap);
+        }
+    }
+    const char* dir = std::getenv("APS5_TRACE_LUT_WATCH_DIR");
+    if (readable && dir != nullptr) {
+        char path[MAX_PATH];
+        std::snprintf(path, sizeof(path), "%s\\lut-build-src-%02u-%llx.bin", dir, build, static_cast<unsigned long long>(source));
+        if (FILE* file = std::fopen(path, "wb")) {
+            std::fwrite(reinterpret_cast<const void*>(source), 1, 16384, file);
+            std::fclose(file);
+        }
+    }
+}
+
+using GuestMap = std::uint64_t (__attribute__((sysv_abi)) *)(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+std::atomic<GuestMap> g_guestMap{nullptr};
+
+__attribute__((sysv_abi, noinline)) std::uint64_t MapHook(std::uint64_t a, std::uint64_t b, std::uint64_t c, std::uint64_t d, std::uint64_t e, std::uint64_t f, std::uint64_t out) {
+    static const auto exe = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    const bool builder = reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)) - exe == 0x6e5f5f;
+    const auto start = std::chrono::steady_clock::now();
+    if (builder) Report("[lut-build] Map(wait=%llu) called from the LUT builder\n", static_cast<unsigned long long>(f & 0xffffffffu));
+    const auto result = g_guestMap.load(std::memory_order_relaxed)(a, b, c, d, e, f, out);
+    static const int delay = [] { const char* value = std::getenv("APS5_LUT_BUILD_DELAY_MS"); return value ? std::atoi(value) : 0; }();
+    if (builder && delay > 0) {
+        Report("[lut-build] Map returned after %lld us; holding the builder %d ms\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), delay);
+        Sleep(static_cast<DWORD>(delay));
+    }
+    if (builder) {
+        const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+        const auto mapped = IsReadable(out) ? *reinterpret_cast<const std::uint64_t*>(out) : 0;
+        Report("[lut-build] Map returned after %lld us, mapped 0x%llx\n", static_cast<long long>(micros), static_cast<unsigned long long>(mapped));
+    }
+    return result;
+}
+
+using GuestPowf = float (__attribute__((sysv_abi)) *)(float, float);
+std::atomic<GuestPowf> g_guestPowf{nullptr};
+
+__attribute__((sysv_abi, noinline)) float PowfHook(float x, float y) {
+    if (y == 2.2f) LutBuildProbe(__builtin_return_address(0), __builtin_frame_address(0));
+    return g_guestPowf.load(std::memory_order_relaxed)(x, y);
+}
+
 void InstallRangeWatch() {
     const char* text = std::getenv("APS5_WATCH_RANGE");
     if (text == nullptr) return;
@@ -293,6 +396,36 @@ bool HandleWatch(EXCEPTION_POINTERS* info) {
 
 void InstallWatch() {
     InstallRangeWatch();
+    if (std::getenv("APS5_TRACE_LUT_BUILD") != nullptr) {
+        CreateThread(nullptr, 0, [](void*) -> DWORD {
+            const auto exe = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+            const auto slot = exe + 0x4fadd90;
+            HMODULE exeModule = GetModuleHandleW(nullptr);
+            for (int attempt = 0; attempt < 120000; ++attempt) {
+                const auto target = *reinterpret_cast<volatile std::uint64_t*>(slot);
+                HMODULE module = nullptr;
+                if (target != 0 && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(target), &module) && module != nullptr && module != exeModule) {
+                    g_guestPowf.store(reinterpret_cast<GuestPowf>(target));
+                    DWORD old = 0;
+                    VirtualProtect(reinterpret_cast<void*>(slot), 8, PAGE_READWRITE, &old);
+                    reinterpret_cast<std::atomic<std::uint64_t>*>(slot)->store(reinterpret_cast<std::uint64_t>(&PowfHook));
+                    VirtualProtect(reinterpret_cast<void*>(slot), 8, old, &old);
+                    char where[MAX_PATH + 64];
+                    DescribeAddress(target, where, sizeof(where));
+                    const auto entry = exe + 0x4f8b1a0 - 0x3f0000 + 0x50;
+                    g_guestMap.store(reinterpret_cast<GuestMap>(*reinterpret_cast<const std::uint64_t*>(entry)));
+                    VirtualProtect(reinterpret_cast<void*>(entry), 8, PAGE_READWRITE, &old);
+                    reinterpret_cast<std::atomic<std::uint64_t>*>(entry)->store(reinterpret_cast<std::uint64_t>(&MapHook));
+                    VirtualProtect(reinterpret_cast<void*>(entry), 8, old, &old);
+                    Report("[lut-build] hooked the game's powf import (exe+0x4fadd90 -> %s) after %d ms\n", where, attempt);
+                    return 0;
+                }
+                Sleep(1);
+            }
+            Report("[lut-build] powf import never resolved\n");
+            return 0;
+        }, nullptr, 0, nullptr);
+    }
     // APS5_WATCH_ADDR=<absolute hex address> watches guest data that is mapped later: the page is
     // protected once it has been committed.
     if (const char* absolute = std::getenv("APS5_WATCH_ADDR")) {

@@ -3,9 +3,9 @@
 Work-in-progress investigation branch. Not meant for a PR as is: `investigations/` breaks the repository rule of
 adding no files beyond code, tests and debt fragments, and the `Recompiler.cpp` change is a debug aid.
 
-Status (2026-11-23, evening): the LUT never receives its colour-grading data in guest memory; the city LUT
-holds leftovers of whatever used that memory before. Not fixed. Reproduces on `main` at `a182406ffa` and at
-`6555c1425a` (re-tested after rebasing this branch onto it).
+Status (2026-11-23, late evening): **cause found**, not fixed. The game's CPU LUT builder reads a GPU readback
+after its ~1 s Map wait times out, while AnyPS5 is still more than 1 s behind during the city load. See "Session 2" at
+the end. Reproduces on `main` at `6555c1425a`.
 
 ## Live LUT watch (APS5_TRACE_LUT_WATCH)
 
@@ -343,3 +343,58 @@ Note: `Recompiler.cpp` changes the shader cache source version, so a build of th
 ## Related
 
 - Intermittent crash seen during this work: GabbeHags/AnyPS5#2 (`rectangle ABI refers to an unregistered shader`).
+
+## Session 2 (2026-11-23, late evening): the cause is a readback timeout
+
+**Found.** The game builds the LUT on the CPU from a GPU readback, and its readback wait gives up after about 1 s.
+During the city load AnyPS5 runs the copy later than that, so the builder converts stale memory. In the intro
+AnyPS5 keeps up, so the copy lands in time. Holding the builder until the copy lands (`APS5_LUT_BUILD_DELAY_MS=4000`)
+gives correct city colours (confirmed by the user on screen).
+
+The LUT builder, read statically: `exe+0x6e5bc0` (VA `0xad5bc0`, image base `0x3f0000`). It is the frame above the
+tiler; its return address `+0x6e678f` was already in the run-12 stack.
+
+- It hashes the input texture and looks in a cache (`+0x6e6820`). On a miss it allocates the 16^3 staging buffer
+  (`[rbp-0x148]`), then calls the render device's vtable `+0x48` (`exe+0x8c58f0`, a texture-to-buffer copy: the
+  `16x1x1` compute dispatch that reads the tiled `256x16` input and writes the linear `256x16` output), and vtable
+  `+0x50` (`exe+0x8c7870`, Map, called with wait = 1). The mapped pointer lands in `[rbp-0x160]`.
+- With no input (or one under 256x16) it writes an identity LUT; with an input and a mode parameter `> 0` a luma
+  (grey) LUT; otherwise (the case seen, parameter 0) per channel:
+  `out = trunc(255 * srgb_encode(powf(byte / 255, 2.2)))` for bytes 0, 1, 2 of each source texel, alpha `0xff`.
+  Constants: 1/255, 2.2, 0.0031308, 12.92, 0.41666 (1/2.4), 1.055, -0.055, 255.
+- So `0xff800000` is not `-inf`. It is what the builder makes of the source texel `0x3f800000` (1.0f): bytes
+  `00 00 80 3f` become `00 00 80 ff`. Every byte of every bad city texel is a possible output of that function
+  (checked on the `20261123-210207-lut-watch-io` dump). The menu's black LUT is the same function applied to zeros.
+
+Getting a probe in: the game's `powf` (PLT `exe+0x4056d00`, GOT `exe+0x4fadd90`) is **not** AnyPS5's libc. It resolves
+to the title's own bundled Sony libc, `libc.prx.guest.prx+0x5cd30` (`app0\sce_module\libc.prx`), so a probe in
+`powf_nid_postfix` never fires. (Reading the import's name off the ELF tables gave `TSM6whtekok#o#n` = sceNetShutdown,
+which is a misreading; the live slot value is what counts.) New aid `APS5_TRACE_LUT_BUILD=1` (libc `CrashReport.cpp`:
+`LutBuildProbe`, `PowfHook`, `MapHook`) patches that GOT slot and the device's Map vtable entry (`exe+0x4b9b1a0`) at
+start-up. It logs each LUT build (`[lut-build] #N per-channel ... source 0x... output 0x...`, with counts of 1.0f, zero
+and alpha-ff texels), dumps the 16 KiB it reads to `lut-build-src-NN-<addr>.bin`, and times Map
+(`[lut-build] Map returned after N us`). `APS5_LUT_BUILD_DELAY_MS=<ms>` (experiment) sleeps that long after Map
+returns. Launcher arguments: `build`, `delay`.
+
+Runs (all with `io`, `APS5_TRACE_FLUSH` and the build probe; logs in the game's `logs\`):
+
+- `20261123-214432-lut-watch-city-hook` (city): build #0 (menu) reads `0x48ea6b2e00`, all zero, so the LUT is black.
+  Build #1 (city) reads `0x48e9543c00` at log line 18483. AnyPS5 decodes the dispatch that writes it at 18572 and
+  flushes it "for readback before label" at 18573. The CPU read comes first.
+- `20261123-214910-lut-watch-intro-hook` (**intro, saves set aside**): build #1 reads `0x48e94f3a00` at line 24122,
+  *after* the dispatch (24120) and its flush (24121). The source has 4096 opaque texels; the LUT has 4095 distinct
+  colours and no `0xff800000`. **That is why the intro isn't red**: same path and code, but the race goes the other way.
+  (The intro autosaves over `_sd\gaslo*`; the original saves were restored and checked byte for byte.)
+- `20261123-215252-lut-watch-city-map` (city, Map timed): Map waits **1005 ms** (menu) and **1021 ms** (city), then
+  returns anyway. While it waits AnyPS5 is at submission 9717; the copy is in submission 9794. City source: 3253 x 1.0f,
+  giving 3253 `0xff800000`, the usual red LUT.
+- `20261123-215527-lut-watch-city-delay` (city, `APS5_LUT_BUILD_DELAY_MS=4000`): both copies land during the hold.
+  The city LUT has 0 `0xff800000` and 4095 distinct colours, and **the scene is no longer red** (user confirmed).
+
+Why `sync` and `coherent` didn't help: they order AnyPS5's own GPU work and write-backs, but the problem is that
+AnyPS5 is **more than 1 s behind** the game's submissions while the city loads, and the game stops waiting after
+about 1 s. Stricter ordering only makes AnyPS5 slower.
+
+Open: what Map waits on (a label poll with a 1 s timeout, an event-queue wait, ...), and why AnyPS5 is about 76
+submissions (more than 1 s) behind at that point (shader or pipeline compilation during the city load is the first
+suspect).
