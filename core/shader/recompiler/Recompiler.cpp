@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include "CacheKey.hpp"
 #include "CompiledVariant.hpp"
 #include "VertexInputSpecialization.hpp"
@@ -1731,6 +1733,41 @@ auto CountedCompile(Compile&& compile) {
     }
 }
 
+void reportDiskMismatch(const RecompileRequest& request, const CompiledVariant& disk, const CompiledVariant& fresh, std::span<const std::byte> key) {
+    static std::atomic<std::uint64_t> checked{0};
+    static std::atomic<std::uint64_t> mismatched{0};
+    const auto total = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto diskWords = disk.artifact.spirv.Words();
+    const auto freshWords = fresh.artifact.spirv.Words();
+    const bool spirvSame = std::ranges::equal(diskWords, freshWords);
+    const auto diskEntry = ShaderDiskCache::EncodeEntry(key, disk);
+    const auto freshEntry = ShaderDiskCache::EncodeEntry(key, fresh);
+    if (spirvSame && diskEntry == freshEntry) {
+        if (total % 500 == 0) std::fprintf(stderr, "[shader-cache-verify] %llu checked, %llu mismatched\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(mismatched.load()));
+        return;
+    }
+    const auto count = mismatched.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::size_t firstWord = 0;
+    while (firstWord < diskWords.size() && firstWord < freshWords.size() && diskWords[firstWord] == freshWords[firstWord]) ++firstWord;
+    std::size_t firstByte = 0;
+    while (firstByte < diskEntry.size() && firstByte < freshEntry.size() && diskEntry[firstByte] == freshEntry[firstByte]) ++firstByte;
+    if (count > 200) return;
+    std::fprintf(stderr, "[shader-cache-verify] MISMATCH %llu: stage %u code 0x%llx entry %s: spirv %s (%zu vs %zu words, first differing word %zu), entry %zu vs %zu bytes, first differing byte %zu\n",
+        static_cast<unsigned long long>(count), static_cast<unsigned>(request.shader.stage), static_cast<unsigned long long>(request.shader.codeAddress), ShaderDiskCache::EntryName(key).c_str(),
+        spirvSame ? "same" : "differs", diskWords.size(), freshWords.size(), firstWord, diskEntry.size(), freshEntry.size(), firstByte);
+    if (const char* directory = std::getenv("APS5_VERIFY_SHADER_CACHE_DUMP"); directory != nullptr && *directory != '\0') {
+        const auto base = std::filesystem::path(directory) / ShaderDiskCache::EntryName(key);
+        const auto write = [](const std::filesystem::path& path, const void* data, std::size_t bytes) {
+            std::ofstream out(path, std::ios::binary);
+            out.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+        };
+        write(base.string() + ".disk.spv", diskWords.data(), diskWords.size_bytes());
+        write(base.string() + ".fresh.spv", freshWords.data(), freshWords.size_bytes());
+        write(base.string() + ".disk.entry", diskEntry.data(), diskEntry.size());
+        write(base.string() + ".fresh.entry", freshEntry.data(), freshEntry.size());
+    }
+}
+
 std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, bool& cacheHit, ShaderPreparationContext* preparation = nullptr) {
     for (const auto& candidate : source.variants) {
         if (sameLayout(candidate->layout, request.layout)) {
@@ -1746,6 +1783,8 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
     const bool disk = ShaderDiskCache::Enabled() && !DebugProbeActive();
     std::vector<std::byte> diskKey;
     std::shared_ptr<const CompiledVariant> variant;
+    static const bool verifyDisk = std::getenv("APS5_VERIFY_SHADER_CACHE") != nullptr;
+    std::shared_ptr<const CompiledVariant> diskVariant;
     if (disk) {
         ShaderDiskCache::BuildKey(request, HostSubgroupSize(request), diskKey);
         CompiledVariant loaded;
@@ -1757,6 +1796,10 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             variant = std::make_shared<const CompiledVariant>(std::move(loaded));
             NoteShader(2);
         }
+    }
+    if (verifyDisk && variant != nullptr) {
+        diskVariant = std::move(variant);
+        variant = nullptr;
     }
     if (variant == nullptr) {
         static const bool layoutPair = std::getenv("APS5_NO_PERF_LAYOUT_PAIR") == nullptr;
@@ -1774,7 +1817,9 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             if (emissionFailure != nullptr && FailureMemo()) source.emissionFailures.push_back({request.shader.codeAddress, request.layout, emissionFailure});
             throw;
         }
-        if (disk) {
+        if (diskVariant != nullptr) {
+            reportDiskMismatch(request, *diskVariant, *variant, diskKey);
+        } else if (disk) {
             if (auto persisted = ShaderDiskCache::Persist(diskKey, *variant)) variant = std::move(persisted);
             else ShaderDiskCache::Store(std::move(diskKey), variant);
         }
