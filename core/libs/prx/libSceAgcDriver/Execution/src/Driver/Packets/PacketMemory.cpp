@@ -84,6 +84,11 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 if (localDevice != nullptr && submission.queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
                 reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, submission.queue) : 4;
                 if (reason == 1 || reason == 7) GuestMemory::Write(label->address, bytes, 4);
+                if (static const std::uint64_t watchedLabel = [] { const char* text = std::getenv("APS5_TRACE_LABEL"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }(); watchedLabel != 0 && label->address <= watchedLabel && watchedLabel < label->address + bytes.size()) {
+                    std::uint32_t value = 0;
+                    std::memcpy(&value, bytes.data(), std::min<std::size_t>(4, bytes.size()));
+                    std::fprintf(stderr, "[label-eop] %lld ms queue %u stamp %llu reason %d value 0x%x completionStores %u\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()), submission.queue, static_cast<unsigned long long>(stamp), reason, value, static_cast<unsigned>(Graphics::Recorder::PendingCompletionStores()));
+                }
                 if (reason == 0 || reason == 1 || reason == 5 || reason == 7) {
                     noteLabelStore(label->address, bytes, stamp, submission.queue);
                     Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());

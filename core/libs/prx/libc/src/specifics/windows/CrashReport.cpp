@@ -19,6 +19,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <map>
+#include <string>
+#include <thread>
 #include <utility>
 #include <mutex>
 #include <vector>
@@ -279,6 +282,143 @@ void LutBuildProbe(void* returnAddress, void* frameAddress) {
     }
 }
 
+std::string DescribeSampleAddress(std::uint64_t address) {
+    HMODULE module = nullptr;
+    char text[300];
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(address), &module) && module != nullptr) {
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(module, path, sizeof(path));
+        const char* name = std::strrchr(path, '\\');
+        std::snprintf(text, sizeof(text), "%s+0x%llx", name ? name + 1 : path, static_cast<unsigned long long>(address - reinterpret_cast<std::uint64_t>(module)));
+    } else {
+        std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(address));
+    }
+    return text;
+}
+
+void SampleRenderJob() {
+    static std::atomic<bool> running{false};
+    if (running.exchange(true)) return;
+    std::thread([] {
+        std::map<std::string, int> leaves;
+        std::map<std::string, int> handlers;
+        std::map<std::string, int> everything;
+        int samples = 0;
+        int jobSamples = 0;
+        std::vector<std::uint64_t> stack(0x2000);
+        const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(1200);
+        const DWORD self = GetCurrentThreadId();
+        while (std::chrono::steady_clock::now() < end) {
+            std::vector<DWORD> threads;
+            const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            THREADENTRY32 entry{};
+            entry.dwSize = sizeof(entry);
+            for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry)) {
+                if (entry.th32OwnerProcessID == GetCurrentProcessId() && entry.th32ThreadID != self) threads.push_back(entry.th32ThreadID);
+            }
+            CloseHandle(snapshot);
+            for (const DWORD id : threads) {
+                const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, id);
+                if (thread == nullptr) continue;
+                CONTEXT context{};
+                context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                std::size_t words = 0;
+                bool got = false;
+                if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+                    if (GetThreadContext(thread, &context)) {
+                        got = true;
+                        MEMORY_BASIC_INFORMATION memory{};
+                        if (VirtualQuery(reinterpret_cast<const void*>(context.Rsp), &memory, sizeof(memory)) == sizeof(memory) && memory.State == MEM_COMMIT) {
+                            const auto limit = reinterpret_cast<std::uint64_t>(memory.BaseAddress) + memory.RegionSize;
+                            words = std::min<std::size_t>(stack.size(), (limit - context.Rsp) / 8);
+                            std::memcpy(stack.data(), reinterpret_cast<const void*>(context.Rsp), words * 8);
+                        }
+                    }
+                    ResumeThread(thread);
+                }
+                CloseHandle(thread);
+                if (!got) continue;
+                ++samples;
+                static bool labelFound = false;
+                if (!labelFound) {
+                    for (std::size_t i = 1; i < words; ++i) {
+                        if (stack[i] != 0xcd55e8 && context.Rip != 0xcd55e8) continue;
+                        static int diagnostics = 0;
+                        if (diagnostics++ < 4) Report("[job-sample] Map wait frame: thread %lu rip 0x%llx rbp 0x%llx rsp 0x%llx index %zu prev 0x%llx\n", id, static_cast<unsigned long long>(context.Rip), static_cast<unsigned long long>(context.Rbp), static_cast<unsigned long long>(context.Rsp), i, static_cast<unsigned long long>(stack[i - 1]));
+                        const std::uint64_t frame = context.Rbp > context.Rsp + i * 8 && context.Rbp - context.Rsp < 0x100000 ? context.Rbp : stack[i - 1];
+                        if (frame < context.Rsp || frame - context.Rsp > 0x100000 || !IsReadable(frame - 0x790)) break;
+                        const auto targetHolder = *reinterpret_cast<const std::uint64_t*>(frame - 0x790);
+                        std::uint64_t ctx = 0;
+                        if (IsReadable(targetHolder + 0x10)) {
+                            const auto wanted = *reinterpret_cast<const std::uint64_t*>(targetHolder + 0x10);
+                            std::vector<std::uint64_t> candidates{context.R12, context.R13, context.R14, context.R15, context.Rbx};
+                            for (std::size_t k = 0; k < i; ++k) candidates.push_back(stack[k]);
+                            for (const auto candidate : candidates) {
+                                if (candidate < 0x10000 || !IsReadable(candidate + 0x382b0)) continue;
+                                const auto in = *reinterpret_cast<const std::uint64_t*>(candidate + 0x382b0);
+                                if (in < 0x10000 || !IsReadable(in + 0x1e8)) continue;
+                                const auto lab = *reinterpret_cast<const std::uint64_t*>(in + 0x1e8);
+                                if (lab < 0x10000 || !IsReadable(lab)) continue;
+                                const auto value = *reinterpret_cast<const std::uint64_t*>(lab);
+                                if (value - wanted + (1ull << 24) > (1ull << 25)) continue;
+                                ctx = candidate;
+                                break;
+                            }
+                        }
+                        const auto innerPeek = IsReadable(ctx + 0x382b0) ? *reinterpret_cast<const std::uint64_t*>(ctx + 0x382b0) : 0;
+                        const auto labelPeek = innerPeek && IsReadable(innerPeek + 0x1e8) ? *reinterpret_cast<const std::uint64_t*>(innerPeek + 0x1e8) : 0;
+                        if (diagnostics <= 4) Report("[job-sample] Map wait values: frame 0x%llx ctx 0x%llx targetHolder 0x%llx inner 0x%llx label 0x%llx\n", static_cast<unsigned long long>(frame), static_cast<unsigned long long>(ctx), static_cast<unsigned long long>(targetHolder), static_cast<unsigned long long>(innerPeek), static_cast<unsigned long long>(labelPeek));
+                        if (!IsReadable(ctx + 0x382b0) || !IsReadable(targetHolder + 0x10)) break;
+                        const auto inner = *reinterpret_cast<const std::uint64_t*>(ctx + 0x382b0);
+                        if (!IsReadable(inner + 0x1e8)) break;
+                        const auto label = *reinterpret_cast<const std::uint64_t*>(inner + 0x1e8);
+                        if (!IsReadable(label)) break;
+                        Report("[job-sample] Map label: thread %lu frame 0x%llx ctx 0x%llx label 0x%llx value 0x%llx target 0x%llx\n", id, static_cast<unsigned long long>(frame), static_cast<unsigned long long>(ctx), static_cast<unsigned long long>(label), static_cast<unsigned long long>(*reinterpret_cast<const std::uint64_t*>(label)), static_cast<unsigned long long>(*reinterpret_cast<const std::uint64_t*>(targetHolder + 0x10)));
+                        labelFound = true;
+                        break;
+                    }
+                }
+                {
+                    std::string all = std::to_string(id) + " " + DescribeSampleAddress(context.Rip);
+                    int guest = 0;
+                    for (std::size_t i = 0; i < words && guest < 5; ++i) {
+                        if (stack[i] >= 0x400000 && stack[i] < 0x4400000) { all += " < " + DescribeSampleAddress(stack[i]); ++guest; }
+                    }
+                    ++everything[all];
+                }
+                std::size_t job = words;
+                for (std::size_t i = 0; i < words; ++i) {
+                    if (stack[i] >= 0xcbbf00 && stack[i] < 0xcbcd00) { job = i; break; }
+                }
+                if (job == words) continue;
+                ++jobSamples;
+                std::string chain = DescribeSampleAddress(context.Rip);
+                int guest = 0;
+                for (std::size_t i = 0; i < job && guest < 4; ++i) {
+                    if (stack[i] >= 0x400000 && stack[i] < 0x4400000) { chain += " < " + DescribeSampleAddress(stack[i]); ++guest; }
+                }
+                ++leaves[DescribeSampleAddress(context.Rip)];
+                ++handlers[chain + " < job " + DescribeSampleAddress(stack[job])];
+            }
+            Sleep(2);
+        }
+        Report("[job-sample] %d thread samples, %d inside the render-record job\n", samples, jobSamples);
+        std::vector<std::pair<int, std::string>> sorted;
+        for (const auto& [key, count] : leaves) sorted.emplace_back(count, key);
+        std::sort(sorted.rbegin(), sorted.rend());
+        for (std::size_t i = 0; i < sorted.size() && i < 15; ++i) Report("[job-sample] leaf %d %s\n", sorted[i].first, sorted[i].second.c_str());
+        sorted.clear();
+        for (const auto& [key, count] : handlers) sorted.emplace_back(count, key);
+        std::sort(sorted.rbegin(), sorted.rend());
+        for (std::size_t i = 0; i < sorted.size() && i < 15; ++i) Report("[job-sample] chain %d %s\n", sorted[i].first, sorted[i].second.c_str());
+        sorted.clear();
+        for (const auto& [key, count] : everything) sorted.emplace_back(count, key);
+        std::sort(sorted.rbegin(), sorted.rend());
+        for (std::size_t i = 0; i < sorted.size(); ++i) Report("[job-sample] all %d %s\n", sorted[i].first, sorted[i].second.c_str());
+        running.store(false);
+    }).detach();
+}
+
 using GuestMap = std::uint64_t (__attribute__((sysv_abi)) *)(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
 std::atomic<GuestMap> g_guestMap{nullptr};
 
@@ -286,7 +426,10 @@ __attribute__((sysv_abi, noinline)) std::uint64_t MapHook(std::uint64_t a, std::
     static const auto exe = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
     const bool builder = reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)) - exe == 0x6e5f5f;
     const auto start = std::chrono::steady_clock::now();
-    if (builder) Report("[lut-build] Map(wait=%llu) called from the LUT builder\n", static_cast<unsigned long long>(f & 0xffffffffu));
+    const auto fence = [a] { return IsReadable(a + 0x19740) ? *reinterpret_cast<const std::uint32_t*>(a + 0x19740) : 0u; };
+    const auto field = [a](std::uint64_t offset) { return IsReadable(a + offset) ? *reinterpret_cast<const std::uint32_t*>(a + offset) : 0xdeadu; };
+    if (builder) Report("[lut-build] Map(wait=%llu) called from the LUT builder, this 0x%llx fence 0x%x submitted 0x%x kick 0x%x queue 0x%x inflight 0x%x thread %lu\n", static_cast<unsigned long long>(f & 0xffffffffu), static_cast<unsigned long long>(a), fence(), field(0x19738), field(0x1db8c), field(0x1dbe0), field(0x1db88) & 0xffffu, GetCurrentThreadId());
+    if (builder) SampleRenderJob();
     const auto result = g_guestMap.load(std::memory_order_relaxed)(a, b, c, d, e, f, out);
     static const int delay = [] { const char* value = std::getenv("APS5_LUT_BUILD_DELAY_MS"); return value ? std::atoi(value) : 0; }();
     if (builder && delay > 0) {
@@ -296,7 +439,7 @@ __attribute__((sysv_abi, noinline)) std::uint64_t MapHook(std::uint64_t a, std::
     if (builder) {
         const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
         const auto mapped = IsReadable(out) ? *reinterpret_cast<const std::uint64_t*>(out) : 0;
-        Report("[lut-build] Map returned after %lld us, mapped 0x%llx\n", static_cast<long long>(micros), static_cast<unsigned long long>(mapped));
+        Report("[lut-build] Map returned after %lld us, mapped 0x%llx, fence 0x%x\n", static_cast<long long>(micros), static_cast<unsigned long long>(mapped), fence());
     }
     return result;
 }

@@ -18,6 +18,9 @@ struct KernelSemaWaiter {
     std::int32_t need;
     bool released = false;
     int priority = 0;
+    const void* releasedBy = nullptr;
+    const void* releasedStack[8] = {};
+    unsigned long releasedThread = 0;
 };
 
 struct KernelSemaPrivate {
@@ -35,6 +38,9 @@ struct KernelSemaPrivate {
     std::int32_t waiterCount = 0;
     std::list<KernelSemaWaiter*> queue;
     std::uint64_t cancelGeneration = 0;
+    const void* lastSignalStack[8] = {};
+    unsigned long lastSignalThread = 0;
+    std::chrono::steady_clock::time_point pollFailingSince{};
 };
 
 extern "C" {

@@ -2,6 +2,7 @@
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libc/include/General.hpp"
+#include <windows.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -61,14 +62,32 @@ int APS5_VABI sceKernelPollSema(KernelSema sem, int need) {
  }
 
  std::lock_guard<std::mutex> lock(sem->mutex);
+ static const bool traceLong = std::getenv("APS5_TRACE_LONG_WAITS") != nullptr;
  if (sem->tokenCount < need) {
+  if (traceLong && sem->pollFailingSince == std::chrono::steady_clock::time_point{}) sem->pollFailingSince = std::chrono::steady_clock::now();
   return SCE_KERNEL_ERROR_EBUSY;
  }
+ if (traceLong && sem->pollFailingSince != std::chrono::steady_clock::time_point{}) {
+  const auto polled = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - sem->pollFailingSince).count();
+  if (polled >= 300) std::fprintf(stderr, "[long-poll] sema %p '%s' polled %lld ms by %p thread %lu, signaled by thread %lu stack %p %p %p %p %p %p %p %p\n", static_cast<void*>(sem), sem->name.c_str(), static_cast<long long>(polled), __builtin_return_address(0), GetCurrentThreadId(), sem->lastSignalThread, sem->lastSignalStack[0], sem->lastSignalStack[1], sem->lastSignalStack[2], sem->lastSignalStack[3], sem->lastSignalStack[4], sem->lastSignalStack[5], sem->lastSignalStack[6], sem->lastSignalStack[7]);
+ }
+ sem->pollFailingSince = {};
  sem->tokenCount -= need;
  return KERNEL_SEMA_OK;
 }
 
 int APS5_VABI sceKernelSignalSema(KernelSema sem, int count) {
+ const void* signalCaller = __builtin_return_address(0);
+ const void* signalStack[8] = {};
+ {
+  auto* frame = static_cast<std::uintptr_t*>(__builtin_frame_address(0));
+  for (int i = 0; i < 8 && frame != nullptr && reinterpret_cast<std::uintptr_t>(frame) % 8 == 0; ++i) {
+   signalStack[i] = reinterpret_cast<const void*>(frame[1]);
+   auto* next = reinterpret_cast<std::uintptr_t*>(frame[0]);
+   if (next <= frame || reinterpret_cast<std::uintptr_t>(next) - reinterpret_cast<std::uintptr_t>(frame) > 0x100000) break;
+   frame = next;
+  }
+ }
  if (sem == nullptr) {
   return SCE_KERNEL_ERROR_ESRCH;
  }
@@ -81,6 +100,8 @@ int APS5_VABI sceKernelSignalSema(KernelSema sem, int count) {
   return SCE_KERNEL_ERROR_EINVAL;
  }
  const auto before = sem->tokenCount;
+ std::copy(std::begin(signalStack), std::end(signalStack), std::begin(sem->lastSignalStack));
+ sem->lastSignalThread = GetCurrentThreadId();
  sem->tokenCount += count;
  if (TraceSync()) std::fprintf(stderr, "[sema] signal %p '%s' count=%d have=%d->%d\n", static_cast<void*>(sem), sem->name.c_str(), count, before, sem->tokenCount);
  for (auto it = sem->queue.begin(); it != sem->queue.end();) {
@@ -91,6 +112,9 @@ int APS5_VABI sceKernelSignalSema(KernelSema sem, int count) {
   }
   sem->tokenCount -= waiter->need;
   waiter->released = true;
+  waiter->releasedBy = signalCaller;
+  std::copy(std::begin(signalStack), std::end(signalStack), std::begin(waiter->releasedStack));
+  waiter->releasedThread = GetCurrentThreadId();
   it = sem->queue.erase(it);
  }
  sem->condition.NotifyAll();
@@ -161,6 +185,7 @@ int APS5_VABI sceKernelWaitSema(KernelSema sem, int need, KernelUseconds* time) 
   *time = static_cast<KernelUseconds>(TimedWait::RemainingMicros(deadline));
  }
  traceWait(!acquired);
+ if (std::getenv("APS5_TRACE_LONG_WAITS") != nullptr && waiter.releasedBy != nullptr && std::chrono::steady_clock::now() - waitStart >= std::chrono::milliseconds(500)) std::fprintf(stderr, "[long-wait] sema %p '%s' released by caller %p thread waited from %p signaler thread %lu stack %p %p %p %p %p %p %p %p\n", static_cast<void*>(sem), sem->name.c_str(), waiter.releasedBy, caller, waiter.releasedThread, waiter.releasedStack[0], waiter.releasedStack[1], waiter.releasedStack[2], waiter.releasedStack[3], waiter.releasedStack[4], waiter.releasedStack[5], waiter.releasedStack[6], waiter.releasedStack[7]);
  if (waiter.released) {
   traceSyncWaitEnd(KERNEL_SEMA_OK);
   return KERNEL_SEMA_OK;
