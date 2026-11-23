@@ -93,9 +93,9 @@ Summary of everything found so far, for a fresh session. The run-by-run log with
 
 ## Where things are
 
-- Repo: `D:\dev\ps5\AnyPS5`, branch `debug/mafia-red-tint` (rebased on `main` `6555c1425a`, pushed at `d595eb864d`).
-  **All debug aids below are uncommitted local changes** on that branch. The checkout is shared with the user's
-  other work (branch `agc-sampled-surface-import`), so check the branch before switching.
+- Repo: `D:\dev\ps5\AnyPS5`, branch `debug/mafia-red-tint` on `GabbeHags/AnyPS5` (two commits on `main` at
+  `6555c1425a`; the debug aids below are in `f6e4d0f0e6`). The checkout is shared with the user's other work
+  (branch `agc-sampled-surface-import`), so check the branch before switching.
 - Game: `D:\dev\ps5\games\Mafia Definitive Edition`. Install a build with
   `cp -a build/core/libs/libs/. "<game>/libs/"` (originals in `libs-backup-before-main\`). Build with
   `ninja -C build` and `D:/winlibs_mingw/mingw64/bin` on `PATH`.
@@ -105,7 +105,7 @@ Summary of everything found so far, for a fresh session. The run-by-run log with
   profile) and `reset-test.ps1` are in `launchers\`. Old logs are in `logs\archive-2026-11-23-bisect\`.
 - Capture from the first session: `D:\dev\ps5\captures\mafia-city` (replays red).
 
-### Debug aids (uncommitted, all off by default)
+### Debug aids (all off by default)
 
 | Switch | Where | What |
 |---|---|---|
