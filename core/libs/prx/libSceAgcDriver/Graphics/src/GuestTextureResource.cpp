@@ -3,6 +3,11 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <chrono>
+#include <unordered_map>
+#include <vector>
+#include <cstdlib>
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include <array>
@@ -375,7 +380,189 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> descri
         Require(fits, "guest texture descriptor starts past the surface's last mip level at levels that would move the surface's own" + describe());
         result.mipCount = lastLevel + 1u;
     }
+    if (result.dccAddress != 0 || result.fmaskCmaskAddress != 0) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "texture %ux%u format %u at 0x%llx", width, height, format, static_cast<unsigned long long>(result.baseAddress));
+        const std::uint64_t texels = static_cast<std::uint64_t>(width) * height * (dimension == TextureDimension::k3D || dimension == TextureDimension::k2DArray ? depth + 1u : 1u);
+        if (result.dccAddress != 0) DebugLutWatchRange("texture dcc", result.dccAddress, std::max<std::uint64_t>(texels * 16u / 256u, 1u), text);
+        if (result.fmaskCmaskAddress != 0) DebugLutWatchRange("texture cmask", result.fmaskCmaskAddress, std::max<std::uint64_t>(texels / 64u, 1u), text);
+    }
+    DebugLutWatch("texture", result.baseAddress, width, height, dimension == TextureDimension::k3D || dimension == TextureDimension::k2DArray || dimension == TextureDimension::k1DArray ? depth + 1u : 1u, format, dimension == TextureDimension::k3D, descriptor);
     return result;
+}
+
+namespace {
+
+struct LutWatchView {
+    std::uint64_t address;
+    std::uint64_t end;
+    double seconds;
+    std::string text;
+};
+
+struct LutWatchState {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    std::mutex mutex;
+    std::vector<LutWatchView> history;
+    std::vector<std::uint64_t> luts;
+};
+
+LutWatchState& lutWatch() {
+    static LutWatchState state;
+    return state;
+}
+
+bool lutWatchEnabled() {
+    static const bool enabled = std::getenv("APS5_TRACE_LUT_WATCH") != nullptr;
+    return enabled;
+}
+
+}
+
+void DebugLutWatchRange(const char* kind, std::uint64_t address, std::uint64_t bytes, const char* text) {
+    if (!lutWatchEnabled() || address == 0 || bytes == 0) return;
+    static std::unordered_map<std::uint64_t, bool> seen;
+    std::uint64_t key = 1469598103934665603ull;
+    for (const std::uint64_t part : {reinterpret_cast<std::uint64_t>(kind), address, bytes}) key = (key ^ part) * 1099511628211ull;
+    auto& state = lutWatch();
+    std::lock_guard lock(state.mutex);
+    const bool fresh = seen.try_emplace(key, true).second;
+    bool coversLut = false;
+    for (const auto lut : state.luts) coversLut = coversLut || (address < lut + 0x10000u && lut < address + bytes);
+    const bool packetCopy = kind[0] == 'd' || kind[0] == 'c' || kind[0] == 'p';
+    static std::uint32_t copiesPrinted = 0;
+    if (packetCopy && bytes >= 0x1000u && bytes <= 0x10000u && copiesPrinted < 600u) {
+        ++copiesPrinted;
+        const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - state.start).count();
+        std::fprintf(stderr, "[lut-watch] at %.3f s %s 0x%llx+0x%llx: %s\n", now, kind, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), text);
+    }
+    if (!fresh && !coversLut) return;
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - state.start).count();
+    char line[320];
+    std::snprintf(line, sizeof(line), "%s 0x%llx..0x%llx of %s", kind, static_cast<unsigned long long>(address), static_cast<unsigned long long>(address + bytes), text);
+    if (fresh) state.history.push_back({address, address + bytes, seconds, line});
+    static std::uint32_t printed = 0;
+    if (coversLut && printed < 40u) {
+        ++printed;
+        std::fprintf(stderr, "[lut-watch] at %.3f s %s covers a LUT\n", seconds, line);
+    }
+}
+
+void DebugLutWatchWriteBack(std::uint64_t from, std::uint64_t to, std::uint64_t base, std::uint32_t width, std::uint32_t height, std::uint32_t format, bool keptGuest) {
+    if (!lutWatchEnabled() || from >= to) return;
+    auto& state = lutWatch();
+    std::lock_guard lock(state.mutex);
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - state.start).count();
+    char line[256];
+    std::snprintf(line, sizeof(line), "write-back 0x%llx..0x%llx of storage image 0x%llx %ux%u format %u%s", static_cast<unsigned long long>(from), static_cast<unsigned long long>(to), static_cast<unsigned long long>(base), width, height, format, keptGuest ? " (keeping guest bytes)" : "");
+    state.history.push_back({from, to, seconds, line});
+    for (const auto lut : state.luts) {
+        if (from < lut + 0x10000u && lut < to) std::fprintf(stderr, "[lut-watch] at %.3f s %s covers LUT 0x%llx\n", seconds, line, static_cast<unsigned long long>(lut));
+    }
+}
+
+void DebugLutWatch(const char* source, std::uint64_t address, std::uint32_t width, std::uint32_t height, std::uint32_t depth, std::uint32_t format, bool volume, std::span<const std::uint32_t> words) {
+    if (!lutWatchEnabled()) return;
+    const bool lutShape = volume && width == 16u && height == 16u && depth == 16u;
+    const bool interesting = lutShape || (volume && width <= 64u && height <= 64u) || (width == 16u && height == 16u) || (width * height == 4096u && (width == 256u || height == 256u)) || format == 130u;
+    struct Seen {
+        std::chrono::steady_clock::time_point lastScan{};
+        std::uint64_t lastHash = 0;
+        std::uint32_t dumps = 0;
+    };
+    auto& state = lutWatch();
+    const auto start = state.start;
+    auto& mutex = state.mutex;
+    auto& history = state.history;
+    static std::unordered_map<std::uint64_t, Seen> seen;
+    std::uint64_t key = 1469598103934665603ull;
+    for (const std::uint64_t part : {static_cast<std::uint64_t>(source[0]), address, static_cast<std::uint64_t>(width), static_cast<std::uint64_t>(height), static_cast<std::uint64_t>(depth), static_cast<std::uint64_t>(format), static_cast<std::uint64_t>(volume)}) key = (key ^ part) * 1099511628211ull;
+    std::lock_guard lock(mutex);
+    auto [entry, inserted] = seen.try_emplace(key);
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - start).count();
+    if (inserted) {
+        std::string text;
+        for (const auto word : words) {
+            char hex[12];
+            std::snprintf(hex, sizeof(hex), " %08x", word);
+            text += hex;
+        }
+        char line[256];
+        std::snprintf(line, sizeof(line), "%s 0x%llx %ux%ux%u format %u%s words%s", source, static_cast<unsigned long long>(address), width, height, depth, format, volume ? " 3D" : "", text.c_str());
+        const std::uint64_t bytes = std::max<std::uint64_t>(0x10000u, static_cast<std::uint64_t>(width) * height * std::max(depth, 1u) * 16u);
+        history.push_back({address, address + bytes, seconds, line});
+        if (lutShape) state.luts.push_back(address);
+        static std::vector<std::pair<std::uint64_t, std::string>> unwrapped;
+        if (width == 256u && height == 16u && !volume && format == 56u) unwrapped.emplace_back(address, line);
+        if (interesting) std::fprintf(stderr, "[lut-watch] first %s\n", line);
+        if (lutShape) {
+            const char* dir = std::getenv("APS5_TRACE_LUT_WATCH_DIR");
+            const std::string directory = dir != nullptr && *dir != '\0' ? std::string(dir) + "/" : std::string();
+            for (const auto& [source, description] : unwrapped) {
+                constexpr std::size_t SourceBytes = 0x4000;
+                const auto* bytes32 = reinterpret_cast<const std::uint32_t*>(source);
+                if (!GuestMemory::Accessible(bytes32, SourceBytes)) {
+                    std::fprintf(stderr, "[lut-watch] source for 0x%llx: %s not accessible\n", static_cast<unsigned long long>(address), description.c_str());
+                    continue;
+                }
+                std::size_t negInf = 0, zero = 0, opaque = 0;
+                for (std::size_t i = 0; i < SourceBytes / 4u; ++i) {
+                    negInf += bytes32[i] == 0xff800000u;
+                    zero += bytes32[i] == 0u;
+                    opaque += (bytes32[i] >> 24u) == 0xffu;
+                }
+                char name[128];
+                std::snprintf(name, sizeof(name), "lut-watch-src-%llx-for-%llx.bin", static_cast<unsigned long long>(source), static_cast<unsigned long long>(address));
+                if (std::FILE* file = std::fopen((directory + name).c_str(), "wb")) {
+                    std::fwrite(bytes32, 1, SourceBytes, file);
+                    std::fclose(file);
+                }
+                std::fprintf(stderr, "[lut-watch] source for 0x%llx: first 16 KiB of %s: 0xff800000 %zu, zero %zu, alpha 0xff %zu (of 4096 dwords) -> %s\n", static_cast<unsigned long long>(address), description.c_str(), negInf, zero, opaque, name);
+            }
+            std::size_t shown = 0;
+            for (const auto& view : history) {
+                if (view.address >= address + 0x10000u || view.end <= address) continue;
+                if (++shown > 200) continue;
+                std::fprintf(stderr, "[lut-watch] overlap of 0x%llx: at %.3f s %s\n", static_cast<unsigned long long>(address), view.seconds, view.text.c_str());
+            }
+            std::fprintf(stderr, "[lut-watch] overlap of 0x%llx: %zu views of %zu recorded (at most 200 shown)\n", static_cast<unsigned long long>(address), shown, history.size());
+        }
+    }
+    if (!lutShape) return;
+    if (!inserted && now - entry->second.lastScan < std::chrono::milliseconds(250)) return;
+    entry->second.lastScan = now;
+    constexpr std::size_t Bytes = 0x10000;
+    const auto* memory = reinterpret_cast<const std::uint32_t*>(address);
+    if (!GuestMemory::Accessible(memory, Bytes)) {
+        if (inserted) std::fprintf(stderr, "[lut-watch] %s 0x%llx: 64 KiB not accessible\n", source, static_cast<unsigned long long>(address));
+        return;
+    }
+    std::uint64_t hash = 1469598103934665603ull;
+    std::size_t negInf = 0, zero = 0, black = 0, other = 0;
+    for (std::size_t i = 0; i < Bytes / 4u; ++i) {
+        const auto value = memory[i];
+        hash = (hash ^ value) * 1099511628211ull;
+        if (value == 0xff800000u) ++negInf;
+        else if (value == 0u) ++zero;
+        else if (value == 0xff000000u) ++black;
+        else ++other;
+    }
+    if (!inserted && hash == entry->second.lastHash) return;
+    entry->second.lastHash = hash;
+    std::fprintf(stderr, "[lut-watch] contents %s 0x%llx at %.3f s: 0xff800000 %zu, zero %zu, 0xff000000 %zu, other %zu (of %zu dwords), hash %016llx\n", source, static_cast<unsigned long long>(address), seconds, negInf, zero, black, other, Bytes / 4u, static_cast<unsigned long long>(hash));
+    if (entry->second.dumps < 16u) {
+        static const std::string directory = [] {
+            const char* text = std::getenv("APS5_TRACE_LUT_WATCH_DIR");
+            return text != nullptr && *text != '\0' ? std::string(text) + "/" : std::string();
+        }();
+        char name[96];
+        std::snprintf(name, sizeof(name), "lut-watch-%llx-%02u.bin", static_cast<unsigned long long>(address), entry->second.dumps++);
+        if (std::FILE* file = std::fopen((directory + name).c_str(), "wb")) {
+            std::fwrite(memory, 1, Bytes, file);
+            std::fclose(file);
+        }
+    }
 }
 
 namespace {

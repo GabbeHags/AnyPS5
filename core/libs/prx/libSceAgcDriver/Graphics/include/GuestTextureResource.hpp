@@ -154,6 +154,13 @@ std::optional<std::uint64_t> TextureResourceAllocationAddress(std::span<const st
 bool IsNullSampledTextureResource(std::span<const std::uint32_t> words);
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words);
 
+// Debug aid (Mafia red tint investigation): APS5_TRACE_LUT_WATCH=1 logs small 3D and 16x16-ish
+// textures and color targets the first time each is decoded, and tracks the contents of 16x16x16
+// volumes (the colour-grading LUT) as they change ([lut-watch] lines, lut-watch-*.bin dumps).
+void DebugLutWatchRange(const char* kind, std::uint64_t address, std::uint64_t bytes, const char* text);
+void DebugLutWatchWriteBack(std::uint64_t from, std::uint64_t to, std::uint64_t base, std::uint32_t width, std::uint32_t height, std::uint32_t format, bool keptGuest);
+void DebugLutWatch(const char* source, std::uint64_t address, std::uint32_t width, std::uint32_t height, std::uint32_t depth, std::uint32_t format, bool volume, std::span<const std::uint32_t> words);
+
 struct TextureResourceDecode {
     GuestTextureResource resource{};
     std::shared_ptr<const std::string> rejection;

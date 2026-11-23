@@ -4052,6 +4052,19 @@ void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> cur
     }
 }
 
+void WriteChangedCommittedKeepingGuest(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
+    require(current.size() == original.size(), "write-back snapshot sizes differ");
+    if (Accessible(reinterpret_cast<const void*>(address), current.size(), true)) {
+        WriteChangedKeepingGuest(address, current, original);
+        return;
+    }
+    for (const auto& [begin, end] : CommittedRanges(address, current.size(), true)) {
+        const auto offset = static_cast<std::size_t>(begin - address);
+        const auto length = static_cast<std::size_t>(end - begin);
+        WriteChangedKeepingGuest(begin, current.subspan(offset, length), original.subspan(offset, length));
+    }
+}
+
 #if defined(__x86_64__) || defined(_M_X64)
 static std::uint32_t changedByteCount(__m128i same) {
     const auto sums = _mm_sad_epu8(_mm_and_si128(same, _mm_set1_epi8(1)), _mm_setzero_si128());

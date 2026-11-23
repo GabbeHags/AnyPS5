@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -417,6 +418,11 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
     if (Pm4::DmaSource(packet) == 0 || Pm4::DmaSource(packet) == 3) Graphics::RequireNoMultisampleTarget(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), packet[6] & 0x3ffffffu, "a DMA copy");
     const auto copy = Pm4::DecodeMemoryCopy(packet);
     if (!copy.has_value() || copy->destination % 4 != 0 || copy->bytes % 4 != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) return false;
+    {
+        char text[96];
+        std::snprintf(text, sizeof(text), "DMA copy from 0x%llx (queued)", static_cast<unsigned long long>(copy->source));
+        Graphics::DebugLutWatchRange("dma copy", copy->destination, copy->bytes, text);
+    }
     DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::DmaCopy, [this, queue, copy = *copy] {
         DrawPipeline::Queue0().ReleaseRunningReads();
         GuestMemory::SetCurrentPacket(0x50, queue);
@@ -466,6 +472,11 @@ void Driver::commitStore(std::uint32_t queue, std::uint64_t address, std::span<c
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto localDevice = device.Load();
+    {
+        char text[64];
+        std::snprintf(text, sizeof(text), "packet store, queue %u", queue);
+        Graphics::DebugLutWatchRange("packet store", address, bytes.size(), text);
+    }
     Graphics::StorageTexture::FlushPending(address, bytes.size(), nullptr, "packet store", Graphics::PublishScope::PartialUnits);
     recordDeferredLabels(localDevice.get(), queue);
     int reason = 4;

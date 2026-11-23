@@ -21,6 +21,7 @@
 #include <iterator>
 #include <utility>
 #include <mutex>
+#include <vector>
 #include "Sse4aEmulation.hpp"
 
 namespace {
@@ -102,7 +103,144 @@ void ProtectWatchPage(DWORD protection) {
     VirtualProtect(reinterpret_cast<void*>(g_watchPage), 0x1000, protection, &old);
 }
 
+constexpr std::uintptr_t RangeSlotBytes = 0x10000;
+constexpr std::size_t RangeMaxSlots = 64;
+constexpr std::uint32_t RangeFaultBudget = 400;
+std::uintptr_t g_rangeBegin = 0;
+std::uintptr_t g_rangeEnd = 0;
+std::atomic<std::uint32_t> g_rangeFaults[RangeMaxSlots];
+std::atomic<std::uint32_t> g_rangeReports[RangeMaxSlots];
+std::atomic<std::uint32_t> g_rangeMarkers[RangeMaxSlots];
+std::atomic<bool> g_rangeReleased[RangeMaxSlots];
+thread_local bool t_rangeStepping = false;
+thread_local std::uintptr_t t_rangePage = 0;
+thread_local std::uintptr_t t_rangeFault = 0;
+thread_local bool t_rangeReported = false;
+thread_local char t_rangeWhere[MAX_PATH + 64];
+thread_local char t_rangeCaller[MAX_PATH + 64];
+
+std::size_t RangeSlot(std::uintptr_t address) {
+    return static_cast<std::size_t>((address - g_rangeBegin) / RangeSlotBytes);
+}
+
+bool InRangeWatchPage(std::uintptr_t address) {
+    return g_rangeEnd != 0 && address >= g_rangeBegin && address < g_rangeEnd && (address - g_rangeBegin) % RangeSlotBytes < 0x1000 && RangeSlot(address) < RangeMaxSlots;
+}
+
+void ProtectRangePage(std::uintptr_t page, DWORD protection) {
+    DWORD old;
+    VirtualProtect(reinterpret_cast<void*>(page), 0x1000, protection, &old);
+}
+
+bool HandleRangeWatch(EXCEPTION_POINTERS* info) {
+    if (g_rangeEnd == 0) return false;
+    const auto* record = info->ExceptionRecord;
+    auto* context = info->ContextRecord;
+    if (record->ExceptionCode == EXCEPTION_SINGLE_STEP && t_rangeStepping) {
+        t_rangeStepping = false;
+        const auto slot = RangeSlot(t_rangePage);
+        if (!g_rangeReleased[slot].load()) ProtectRangePage(t_rangePage, PAGE_READONLY);
+        const auto aligned = t_rangeFault & ~static_cast<std::uintptr_t>(3);
+        const auto value = *reinterpret_cast<const std::uint32_t*>(aligned);
+        if (t_rangeReported) Report("[range-watch]   now 0x%08x at 0x%llx\n", value, static_cast<unsigned long long>(aligned));
+        if ((value == 0xff800000u || value == 0xff000000u) && g_rangeMarkers[slot].fetch_add(1) < 12u) {
+            Report("[range-watch] slot 0x%llx: 0x%08x stored at 0x%llx by %s (caller %s) at %lld ms\n", static_cast<unsigned long long>(g_rangeBegin + slot * RangeSlotBytes), value, static_cast<unsigned long long>(aligned), t_rangeWhere, t_rangeCaller, static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
+        }
+        return true;
+    }
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || record->ExceptionInformation[0] != 1) return false;
+    const auto address = static_cast<std::uintptr_t>(record->ExceptionInformation[1]);
+    if (!InRangeWatchPage(address)) return false;
+    const auto page = address & ~static_cast<std::uintptr_t>(0xfff);
+    const auto slot = RangeSlot(address);
+    t_rangeFault = address;
+    t_rangePage = page;
+    DescribeAddress(context->Rip, t_rangeWhere, sizeof(t_rangeWhere));
+    t_rangeCaller[0] = '\0';
+    if (IsReadable(context->Rbp) && IsReadable(context->Rbp + 8)) {
+        const auto returnAddress = reinterpret_cast<const std::uint64_t*>(context->Rbp)[1];
+        if (IsExecutable(returnAddress)) DescribeAddress(returnAddress, t_rangeCaller, sizeof(t_rangeCaller));
+    }
+    static const auto driver = reinterpret_cast<std::uintptr_t>(GetModuleHandleA("libSceAgcDriver.prx"));
+    HMODULE writer = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(context->Rip), &writer);
+    const bool fromDriver = driver != 0 && reinterpret_cast<std::uintptr_t>(writer) == driver;
+    static std::atomic<std::uint32_t> driverFaults[RangeMaxSlots];
+    static std::atomic<std::uint32_t> driverReports[RangeMaxSlots];
+    std::uint32_t faults = 0;
+    if (fromDriver) {
+        const auto count = driverFaults[slot].fetch_add(1) + 1;
+        t_rangeReported = driverReports[slot].fetch_add(1) < 1u;
+        if (count % 4096u == 0u) Report("[range-watch] slot 0x%llx: %u driver faults so far\n", static_cast<unsigned long long>(g_rangeBegin + slot * RangeSlotBytes), count);
+        faults = count >= 200000u ? RangeFaultBudget : 0u;
+    } else {
+        faults = g_rangeFaults[slot].fetch_add(1) + 1;
+        t_rangeReported = g_rangeReports[slot].fetch_add(1) < 6u;
+    }
+    if (t_rangeReported) {
+        Report("[range-watch] slot 0x%llx: thread %lu writes 0x%llx at %s rcx=%llx rdx=%llx r8=%llx at %lld ms\n", static_cast<unsigned long long>(g_rangeBegin + slot * RangeSlotBytes), GetCurrentThreadId(), static_cast<unsigned long long>(address), t_rangeWhere, context->Rcx, context->Rdx, context->R8, static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
+        char line[MAX_PATH + 64];
+        std::uint64_t frame = context->Rbp;
+        for (int depth = 0; depth < 8 && frame != 0 && (frame & 7) == 0 && IsReadable(frame) && IsReadable(frame + 8); ++depth) {
+            const auto returnAddress = reinterpret_cast<const std::uint64_t*>(frame)[1];
+            if (!IsExecutable(returnAddress)) break;
+            DescribeAddress(returnAddress, line, sizeof(line));
+            Report("[range-watch]     #%d %s\n", depth, line);
+            const auto next = reinterpret_cast<const std::uint64_t*>(frame)[0];
+            if (next <= frame) break;
+            frame = next;
+        }
+        for (std::uint64_t at = context->Rsp; at < context->Rsp + 0x100 && IsReadable(at); at += 8) {
+            const auto value = *reinterpret_cast<const std::uint64_t*>(at);
+            if (!IsExecutable(value)) continue;
+            DescribeAddress(value, line, sizeof(line));
+            Report("[range-watch]     [rsp+0x%llx] %s\n", static_cast<unsigned long long>(at - context->Rsp), line);
+        }
+    }
+    if (faults >= RangeFaultBudget && !g_rangeReleased[slot].exchange(true)) {
+        Report("[range-watch] slot 0x%llx: %u faults, released\n", static_cast<unsigned long long>(g_rangeBegin + slot * RangeSlotBytes), faults);
+    }
+    ProtectRangePage(page, PAGE_READWRITE);
+    context->EFlags |= 0x100;
+    t_rangeStepping = true;
+    return true;
+}
+
+void InstallRangeWatch() {
+    const char* text = std::getenv("APS5_WATCH_RANGE");
+    if (text == nullptr) return;
+    char* end = nullptr;
+    const auto begin = std::strtoull(text, &end, 16);
+    const auto bytes = *end == ':' ? std::strtoull(end + 1, nullptr, 16) : 0ull;
+    if (begin == 0 || bytes == 0 || begin % RangeSlotBytes != 0) {
+        Report("[range-watch] APS5_WATCH_RANGE takes <hex 64 KiB-aligned address>:<hex bytes>\n");
+        return;
+    }
+    g_rangeBegin = static_cast<std::uintptr_t>(begin);
+    g_rangeEnd = static_cast<std::uintptr_t>(begin + std::min<std::uint64_t>(bytes, RangeSlotBytes * RangeMaxSlots));
+    CreateThread(nullptr, 0, [](void*) -> DWORD {
+        Libc::SetHostMxcsr();
+        std::vector<bool> armed(RangeMaxSlots, false);
+        std::size_t remaining = static_cast<std::size_t>((g_rangeEnd - g_rangeBegin + RangeSlotBytes - 1) / RangeSlotBytes);
+        while (remaining != 0) {
+            for (std::size_t slot = 0; slot < RangeMaxSlots && g_rangeBegin + slot * RangeSlotBytes < g_rangeEnd; ++slot) {
+                if (armed[slot]) continue;
+                const auto page = g_rangeBegin + slot * RangeSlotBytes;
+                MEMORY_BASIC_INFORMATION memory{};
+                if (VirtualQuery(reinterpret_cast<const void*>(page), &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT) continue;
+                armed[slot] = true;
+                --remaining;
+                ProtectRangePage(page, PAGE_READONLY);
+                Report("[range-watch] watching the first page of slot 0x%llx\n", static_cast<unsigned long long>(page));
+            }
+            Sleep(1);
+        }
+        return 0;
+    }, nullptr, 0, nullptr);
+}
+
 bool HandleWatch(EXCEPTION_POINTERS* info) {
+    if (HandleRangeWatch(info)) return true;
     if (g_watchPage == 0) return false;
     const auto* record = info->ExceptionRecord;
     auto* context = info->ContextRecord;
@@ -154,6 +292,7 @@ bool HandleWatch(EXCEPTION_POINTERS* info) {
 }
 
 void InstallWatch() {
+    InstallRangeWatch();
     // APS5_WATCH_ADDR=<absolute hex address> watches guest data that is mapped later: the page is
     // protected once it has been committed.
     if (const char* absolute = std::getenv("APS5_WATCH_ADDR")) {

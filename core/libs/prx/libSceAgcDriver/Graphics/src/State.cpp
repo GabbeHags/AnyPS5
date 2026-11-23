@@ -571,6 +571,14 @@ DepthTarget decodeDepthPlane(const Registers& cx) {
         depth.htileAddress = base(0x005, 0x01e) + static_cast<std::uint64_t>(view & 0x1fffu) * sliceBytes + htileMipOffset;
         depth.htileStencil = stencil && !depth.htileDepthOnly;
     }
+    {
+        const auto planeBytes = static_cast<std::uint64_t>(depth.extent.width) * depth.extent.height;
+        char text[160];
+        std::snprintf(text, sizeof(text), "depth %ux%u format %d plane 0x%llx stencil 0x%llx htile 0x%llx", depth.extent.width, depth.extent.height, static_cast<int>(depth.format), static_cast<unsigned long long>(depth.address), static_cast<unsigned long long>(depth.stencilAddress), static_cast<unsigned long long>(depth.htileAddress));
+        if (depth.address != 0) DebugLutWatchRange("depth plane", depth.address, planeBytes * (zFormat == 1 ? 2u : 4u), text);
+        if (depth.stencilAddress != 0) DebugLutWatchRange("stencil plane", depth.stencilAddress, planeBytes, text);
+        if (depth.htileAddress != 0) DebugLutWatchRange("htile", depth.htileAddress, HtileMetadataBytes(depth.extent), text);
+    }
     return depth;
 }
 
@@ -2747,6 +2755,19 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot, bool allo
     if (volume && color.tileMode != ColorTileMode::Linear) {
         color.bytes = SurfaceGuestBytes(SurfaceForTarget(color));
         GuestMemory::CheckRange(reinterpret_cast<const void*>(color.surfaceAddress), color.bytes, colorLayout.Alignment(), true);
+    }
+    // Words: CB_COLOR_INFO, CB_COLOR_ATTRIB, the target's own address (low, high), depth slice, mip, slot.
+    const std::array<std::uint32_t, 7> watchWords{info, attrib, static_cast<std::uint32_t>(color.address), static_cast<std::uint32_t>(color.address >> 32u), color.depthSlice, color.mip, slot};
+    DebugLutWatch("color", color.surfaceAddress != 0 ? color.surfaceAddress : color.address, color.extent.width, color.extent.height, color.volume ? color.depth : color.layers, static_cast<std::uint32_t>(color.format), color.volume, watchWords);
+    {
+        char text[160];
+        std::snprintf(text, sizeof(text), "color %ux%u format %d at 0x%llx (dcc 0x%llx cmask 0x%llx fmask 0x%llx)", color.extent.width, color.extent.height, static_cast<int>(color.format), static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.dccAddress), static_cast<unsigned long long>(color.cmaskAddress), static_cast<unsigned long long>(color.fmaskAddress));
+        const auto texelBytes = static_cast<std::uint64_t>(color.extent.width) * color.extent.height * color.elementBytes;
+        DebugLutWatchRange("color plane", color.address, color.bytes != 0 ? color.bytes : texelBytes, text);
+        if (color.dccAddress != 0) DebugLutWatchRange("color dcc", color.dccAddress, std::max<std::uint64_t>(texelBytes / 256u, 1u), text);
+        if (color.chainDccAddress != 0) DebugLutWatchRange("color chain dcc", color.chainDccAddress, std::max<std::uint64_t>(texelBytes / 256u, 1u), text);
+        if (color.cmaskAddress != 0) DebugLutWatchRange("color cmask", color.cmaskAddress, color.cmaskBytes != 0 ? color.cmaskBytes : 1u, text);
+        if (color.fmaskAddress != 0) DebugLutWatchRange("color fmask", color.fmaskAddress, color.gcnFmaskBytes != 0 ? color.gcnFmaskBytes : texelBytes / 4u, text);
     }
     return color;
 }

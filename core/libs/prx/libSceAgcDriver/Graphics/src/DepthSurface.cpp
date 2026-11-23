@@ -1788,6 +1788,15 @@ public:
         auto& counters = depthPlaneStoreCounters();
         ++counters.stores;
         const auto planeBytes = mirror->GuestBytes();
+        {
+            char text[160];
+            std::snprintf(text, sizeof(text), "stale depth plane 0x%llx %ux%u (%s)", static_cast<unsigned long long>(resource.baseAddress), target.extent.width, target.extent.height, StoresUnits(*mirror) ? "units" : "whole");
+            for (std::size_t unit = 0; unit < units.size(); ++unit) {
+                if (StoresUnits(*mirror) && !units[unit]) continue;
+                const auto begin = resource.baseAddress + unit * unitBytes;
+                DebugLutWatchRange("depth store", begin, std::min<std::uint64_t>(unitBytes, planeBytes - std::min<std::uint64_t>(planeBytes, unit * unitBytes)), text);
+            }
+        }
         if (!StoresUnits(*mirror)) {
             units.assign(units.size(), true);
             copyPlane(mirrorPlane, mirror, false, true, true);
@@ -3792,6 +3801,8 @@ void retireStoringStale(DepthSurface& surface) {
         if ((unit < written.size() && written[unit]) || removed[unit] || (unit < reused.size() && reused[unit])) units[unit] = false;
     }
     if ((surface.pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 && anyUnit(written)) units.assign(units.size(), false);
+    static const bool dropStale = std::getenv("APS5_DEPTH_DROP_STALE_STORE") != nullptr;
+    if (dropStale) units.assign(units.size(), false);
     std::shared_ptr<StorageTexture> mirror;
     if (anyUnit(units) && (!anyUnit(written) || surface.StoresUnits(*surface.Mirror(resource)))) mirror = surface.StoreDepthPlane(resource, units);
     retire(surface);
@@ -4394,6 +4405,13 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint6
                 GuestMemory::CollectWritesUncached(plane, static_cast<std::size_t>(planeBytes));
                 surface->SyncFromMemory(resource, true);
                 auto units = scope == DepthPlaneScope::Whole ? surface->staleUnits : surface->StaleUnitsIn(planeBytes, address, end);
+                static const bool dropStale = std::getenv("APS5_DEPTH_DROP_STALE_STORE") != nullptr;
+                if (dropStale && anyUnit(units)) {
+                    static std::atomic<std::uint32_t> dropped{0};
+                    if (dropped.fetch_add(1) < 16u) std::fprintf(stderr, "[depth-drop] dropping stale units of depth plane 0x%llx over a read of 0x%llx+0x%llx\n", static_cast<unsigned long long>(plane), static_cast<unsigned long long>(address), static_cast<unsigned long long>(end - address));
+                    surface->ClearStale(units);
+                    units.assign(units.size(), false);
+                }
                 if (anyUnit(units)) {
                     auto mirror = surface->StoreDepthPlane(resource, units);
                     surface->ClearStale(units);

@@ -8351,10 +8351,13 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // Store only the kept ranges' blocks that changed, so concurrent CPU writes to untouched texels
     // survive; `original` follows for the stored layers (the others' guest bytes are unchanged).
     const auto current = host.Bytes();
+    static const bool keepGuest = std::getenv("APS5_STORAGE_WRITEBACK_KEEP_GUEST") != nullptr;
     for (const auto& [from, to] : stores) {
         const auto offset = static_cast<std::size_t>(from - descriptor.baseAddress);
         const auto length = static_cast<std::size_t>(to - from);
-        GuestMemory::WriteChangedCommitted(from, current.subspan(offset, length), std::span<const std::byte>(original).subspan(offset, length));
+        if (keepGuest) GuestMemory::WriteChangedCommittedKeepingGuest(from, current.subspan(offset, length), std::span<const std::byte>(original).subspan(offset, length));
+        else GuestMemory::WriteChangedCommitted(from, current.subspan(offset, length), std::span<const std::byte>(original).subspan(offset, length));
+        DebugLutWatchWriteBack(from, to, descriptor.baseAddress, descriptor.width, descriptor.height, descriptor.format, keepGuest);
         std::memcpy(original.data() + offset, current.data() + offset, length);
     }
     // The texels now hold the whole image, so later reads must see them rather than a fast clear

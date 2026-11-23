@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -1346,6 +1347,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             const auto destination = CopyDataDestination(packet) == CopyDataSelectGds ? GdsAddress() + packet[4] : address(packet[4], packet[5]);
             const auto data = copyDataSource(packet, queue, CopyDataBytes(packet));
             GuestMemory::CheckRange(reinterpret_cast<void*>(destination), data.size(), 1, true);
+            if (CopyDataDestination(packet) != CopyDataSelectGds) Graphics::DebugLutWatchRange("copy data", destination, data.size(), "COPY_DATA executed by the driver");
             GuestMemory::Write(destination, data);
             return;
         }
@@ -1356,6 +1358,11 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             auto data = dmaSourceBytes(packet);
             const auto destination = dmaDestination(packet) == DmaSelectGds ? GdsAddress() + packet[4] : address(packet[4], packet[5]);
             GuestMemory::CheckRange(reinterpret_cast<void*>(destination), bytes, 1, true);
+            if (dmaDestination(packet) != DmaSelectGds) {
+                char text[96];
+                std::snprintf(text, sizeof(text), "DMA_DATA executed by the driver from 0x%llx (source select %u)", static_cast<unsigned long long>(address(packet[2], packet[3])), dmaSource(packet));
+                Graphics::DebugLutWatchRange("dma direct", destination, bytes, text);
+            }
             GuestMemory::Write(destination, data);
             return;
         }
